@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+# Converted model weights written by phi-3-vision-mlx into the working directory
+models/
+microsoftPhi35visioninstruct_*/
+# Log file the library writes when using its Agent class
+agent_log.json
+# Long-term memory database
+memory.db*
+# Pictures taken by the take_picture tool
+webcam-pictures/
+assets/*.sf2

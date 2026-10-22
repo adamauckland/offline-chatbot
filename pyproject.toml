@@ -1,0 +1,62 @@
+[project]
+name = "scrudley"
+version = "0.1.0"
+description = "Example terminal chatbot for Phi-3.5-vision on Apple silicon, built on phi-3-vision-mlx"
+readme = "README.md"
+requires-python = ">=3.12.3,<3.13"
+dependencies = [
+    "phi-3-vision-mlx==0.1.7",
+    # phi-3-vision-mlx pins numpy 1.26, but its `datasets` dependency pulls in
+    # a pyarrow that requires numpy 2. Keep pyarrow on the last numpy-1 line.
+    "pyarrow<21",
+    # Example local API server the chatbot calls tools on
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    # Text-to-speech (Kyutai Pocket TTS, runs on CPU) and speaker output
+    "pocket-tts>=4.0.1",
+    "sounddevice>=0.5",
+    # Speech-to-text from the microphone (Whisper on MLX)
+    "mlx-whisper>=0.4.3",
+    # Long-term memory: tiny static embeddings for recalling past conversations
+    "model2vec>=0.10",
+    # Always-on wake word (keyword spotting) and voice activity detection
+    "sherpa-onnx>=1.13",
+    "sherpa-onnx-core>=1.13",  # native libs; the sherpa-onnx wheel does not pull it in itself
+    # Optional full-screen UI with the robot face and VU meter (--tui, see tui/app.py)
+    "textual>=1.0",
+    # Webcam capture for the take_picture tool (see images/webcam.py)
+    "opencv-python-headless>=4.10",
+    # SoundFont synth for the play_drums tool (see audio/drums.py)
+    "tinysoundfont>=0.3",
+    "opencv-python-headless>=4.10",
+]
+
+[tool.uv]
+# phi-3-vision-mlx pins numpy==1.26.4 but pocket-tts needs numpy>=2. The vision
+# code runs fine on numpy 2, so lift the pin.
+override-dependencies = [
+    "numpy>=2",
+    # tinysoundfont (the drum SoundFont synth) declares pyaudio, which has no wheel for Apple silicon and
+    # needs PortAudio headers to build. We render to buffers and play through sounddevice, so drop it.
+    "pyaudio; python_version < '0'",
+]
+
+[project.scripts]
+scrudley = "chatbot.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "black>=24",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["chatbot", "audio", "events", "images", "memory", "speech", "tools", "tui"]
+
+[tool.black]
+# The code is written to about 120 columns; black's default of 88 would rewrap most of it.
+line-length = 120
+target-version = ["py312"]
