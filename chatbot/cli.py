@@ -46,20 +46,25 @@ from __future__ import annotations
 import argparse
 import subprocess
 import sys
+import time
+from dataclasses import dataclass
 from pathlib import Path
 
+import requests
+
+from audio.backing import backing_tools
+from audio.drums import drum_tools
 from audio.input import AudioIO
 from audio.listen import Listener
-from audio.stt import CHOICES as STT_CHOICES, describe as describe_stt
-from audio.drums import drum_tools
 from audio.notes import note_tools
+from audio.stt import CHOICES as STT_CHOICES, describe as describe_stt
 from audio.turnaround import Turnaround
 from audio.wake import DEFAULT_WAKE_WORD, WakeListener
 from chatbot.asides import warm_up
-from chatbot.modes import DEFAULT_MODE, MODES, allowed_tools
 from chatbot.control import Control
 from chatbot.conversation import Conversation, load_image
 from chatbot.model import CACHE_TOKENS, DEFAULT_IMAGE_CROPS, load_model
+from chatbot.modes import DEFAULT_MODE, MODES, allowed_tools
 from chatbot.repl import run_repl
 from chatbot.turn import answer
 from memory import DEFAULT_DB, Memory
@@ -73,35 +78,64 @@ DEFAULT_SYSTEM = (
     "and answer questions about it from the facts you have been given. Keep answers short, "
     "one or two sentences unless asked for more."
 )
+TOOLS_SERVER_START_ATTEMPTS = 50
+TOOLS_SERVER_POLL_SECONDS = 0.2
+PROCESS_STOP_TIMEOUT_SECONDS = 3
+
+
+def project_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def tools_server_answers() -> bool:
+    try:
+        requests.get(f"{BASE_URL}/time", timeout=1)
+        return True
+    except requests.RequestException:
+        return False
+
+
+def wait_for_tools_server() -> bool:
+    for _ in range(TOOLS_SERVER_START_ATTEMPTS):
+        time.sleep(TOOLS_SERVER_POLL_SECONDS)
+
+        if tools_server_answers():
+            return True
+
+    return False
 
 
 def ensure_tools_server() -> subprocess.Popen | None:
-    """Start tools/server.py if nothing is listening on its address; return the process."""
-    import time
-
-    import requests
-
-    try:
-        requests.get(f"{BASE_URL}/time", timeout=1)
+    if tools_server_answers():
         return None
-    except requests.RequestException:
-        pass
-    root = Path(__file__).resolve().parent.parent  # the project root, where the packages live
+
+    root = project_root()
+
     if not (root / "tools" / "server.py").is_file():
         return None
+
     proc = subprocess.Popen(
         [sys.executable, "-m", "tools.server"], cwd=root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
-    for _ in range(50):
-        time.sleep(0.2)
-        try:
-            requests.get(f"{BASE_URL}/time", timeout=1)
-            print(f"(started tools/server.py on {BASE_URL})", file=sys.stderr)
-            return proc
-        except requests.RequestException:
-            continue
-    print("(could not start tools/server.py; tool calls will fail)", file=sys.stderr)
+
+    if wait_for_tools_server():
+        print(f"(started tools/server.py on {BASE_URL})", file=sys.stderr)
+    else:
+        print("(could not start tools/server.py; tool calls will fail)", file=sys.stderr)
+
     return proc
+
+
+def stop_process(proc: subprocess.Popen | None) -> None:
+    if proc is None:
+        return
+
+    proc.terminate()
+
+    try:
+        proc.wait(timeout=PROCESS_STOP_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        proc.kill()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -234,136 +268,174 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--tui", action="store_true", help="full-screen terminal UI with a robot face and VU meter (see tui/app.py)"
     )
+
     return parser
 
 
-def main() -> None:
-    parser = build_parser()
-    args = parser.parse_args()
-    if args.tui and args.prompt is not None:
-        parser.error("--tui is for the interactive chat; drop --prompt")
-    if args.list_stt:
-        print("speech-to-text engines on this machine:\n" + describe_stt())
-        return
+def check_arguments(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    interactive = args.prompt is None
 
-    print("Loading model (first run downloads ~8 GB from Hugging Face and converts it)...", file=sys.stderr)
-    preload = load_model(quantize=not args.no_quantize, image_crops=args.image_crops, cache_tokens=args.cache_tokens)
-    audio = None
+    if args.tui and not interactive:
+        parser.error("--tui is for the interactive chat; drop --prompt")
+
+    if (args.hands_free or args.wake_word) and (args.no_listen or not interactive):
+        parser.error("--hands-free and --wake-word need the microphone; drop --no-listen")
+
+    if args.image and interactive:
+        parser.error("--image requires --prompt; in interactive mode use the /image command")
+
+
+@dataclass
+class Devices:
+    audio: AudioIO | None = None
+    turnaround: Turnaround | None = None
+    speaker: Speaker | None = None
+    listener: Listener | None = None
+    wake: WakeListener | None = None
+
+    def close(self) -> None:
+        for device in (self.turnaround, self.wake, self.listener, self.audio):
+            if device is not None:
+                device.close()
+
+
+def open_devices(args: argparse.Namespace) -> Devices:
+    devices = Devices()
+
     if not (args.no_speak and args.no_listen):
-        audio = AudioIO(
+        devices.audio = AudioIO(
             mic=args.mic,
             channel=args.mic_channel,
             speaker=args.speaker,
             mic_gain=args.mic_gain,
             auto_gain=not args.no_auto_gain,
         )
-    turnaround = Turnaround(audio) if audio is not None and not args.no_turnaround else None
-    speaker = None
+
+    if devices.audio is not None and not args.no_turnaround:
+        devices.turnaround = Turnaround(devices.audio)
+
     if not args.no_speak:
         print("Loading speech model...", file=sys.stderr)
-        speaker = Speaker(audio, model=args.tts_model, voice=args.voice, robot=not args.no_robot)
-    listener = None
+        devices.speaker = Speaker(devices.audio, model=args.tts_model, voice=args.voice, robot=not args.no_robot)
+
     if not args.no_listen and args.prompt is None:
-        print(f"Loading speech recognition ({args.stt})...", file=sys.stderr)
-        listener = Listener(audio, args.stt, args.stt_model)
-        print(f"(speech recognition: {listener.transcriber!r})", file=sys.stderr)
-    if (args.hands_free or args.wake_word) and listener is None:
-        parser.error("--hands-free and --wake-word need the microphone; drop --no-listen")
-    wake = None
+        devices.listener = load_listener(devices.audio, args)
+
     if args.wake_word:
         print("Loading wake-word models...", file=sys.stderr)
-        wake = WakeListener(audio, args.wake_word, threshold=args.wake_threshold)
+        devices.wake = WakeListener(devices.audio, args.wake_word, threshold=args.wake_threshold)
+
+    return devices
+
+
+def load_listener(audio: AudioIO | None, args: argparse.Namespace) -> Listener:
+    print(f"Loading speech recognition ({args.stt})...", file=sys.stderr)
+    listener = Listener(audio, args.stt, args.stt_model)
+    print(f"(speech recognition: {listener.transcriber!r})", file=sys.stderr)
+
+    return listener
+
+
+def register_tools(control: Control, audio: AudioIO | None) -> None:
+    control.register_tools()
+
+    if audio is not None:
+        for tool in note_tools(audio) + drum_tools(audio) + backing_tools(audio):
+            register(tool)
+
+
+def system_prompt(args: argparse.Namespace, use_tools: bool) -> str | None:
+    system = args.system or ""
+
+    if use_tools:
+        system = (system + "\n\n" + tools_prompt()).strip()
+
+    return system or None
+
+
+def answer_one_prompt(args, preload, system, use_tools, memory, speaker, control) -> None:
+    convo = Conversation(system)
+    convo.add_user(args.prompt, [load_image(src) for src in args.image])
+    answer(
+        preload,
+        convo,
+        args.max_tokens,
+        use_tools,
+        memory,
+        voice=speaker,
+        control=control,
+        tools=allowed_tools(args.mode),
+        mode=args.mode,
+    )
+
+    if speaker is not None:
+        speaker.wait()
+
+
+def run_chat(args, preload, system, use_tools, memory, devices: Devices, control) -> None:
+    def chat(ask):
+        run_repl(
+            preload,
+            system,
+            args.max_tokens,
+            use_tools,
+            devices.speaker,
+            devices.listener,
+            args.hands_free,
+            memory,
+            devices.wake,
+            ask=ask,
+            control=control,
+            audio=devices.audio,
+            mode=args.mode,
+        )
+
+    if not args.tui:
+        chat(input)
+        return
+
+    from tui import run_tui
+
+    run_tui(
+        chat,
+        typed=devices.wake is None and not args.hands_free,
+        wake_phrase=devices.wake.phrase if devices.wake else None,
+    )
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    check_arguments(parser, args)
+
+    if args.list_stt:
+        print("speech-to-text engines on this machine:\n" + describe_stt())
+        return
+
+    print("Loading model (first run downloads ~8 GB from Hugging Face and converts it)...", file=sys.stderr)
+    preload = load_model(quantize=not args.no_quantize, image_crops=args.image_crops, cache_tokens=args.cache_tokens)
+    devices = open_devices(args)
     memory = None if args.no_memory else Memory(args.memory_db)
     use_tools = not args.no_tools
     tools_proc = ensure_tools_server() if use_tools and not args.no_tools_server else None
     control = Control()
+
     if use_tools:
-        control.register_tools()
-        if audio is not None:
-            for tool in note_tools(audio) + drum_tools(audio):  # they need the speakers, so only with audio
-                register(tool)
-    system = args.system or ""
-    if use_tools:
-        system = (system + "\n\n" + tools_prompt()).strip()
-    system = system or None
+        register_tools(control, devices.audio)
+
+    system = system_prompt(args, use_tools)
     print("Warming up the model...", file=sys.stderr)
-    warm_up(
-        preload, system, allowed_tools(args.mode)
-    )  # the system prompt and the routing prefix, before the first turn
+    warm_up(preload, system, allowed_tools(args.mode))
 
     if args.prompt is not None:
-        convo = Conversation(system)
-        convo.add_user(args.prompt, [load_image(src) for src in args.image])
-        answer(
-            preload,
-            convo,
-            args.max_tokens,
-            use_tools,
-            memory,
-            voice=speaker,
-            control=control,
-            tools=allowed_tools(args.mode),
-            mode=args.mode,
-        )
-        if speaker is not None:
-            speaker.wait()  # answer() spoke the reply as it was generated
+        answer_one_prompt(args, preload, system, use_tools, memory, devices.speaker, control)
         return
 
-    if args.image:
-        parser.error("--image requires --prompt; in interactive mode use the /image command")
     try:
-        if args.tui:
-            from tui import run_tui
-
-            run_tui(
-                lambda ask: run_repl(
-                    preload,
-                    system,
-                    args.max_tokens,
-                    use_tools,
-                    speaker,
-                    listener,
-                    args.hands_free,
-                    memory,
-                    wake,
-                    ask=ask,
-                    control=control,
-                    audio=audio,
-                    mode=args.mode,
-                ),
-                typed=wake is None and not args.hands_free,
-                wake_phrase=wake.phrase if wake else None,
-            )
-        else:
-            run_repl(
-                preload,
-                system,
-                args.max_tokens,
-                use_tools,
-                speaker,
-                listener,
-                args.hands_free,
-                memory,
-                wake,
-                control=control,
-                audio=audio,
-                mode=args.mode,
-            )
+        run_chat(args, preload, system, use_tools, memory, devices, control)
     finally:
-        if turnaround is not None:
-            turnaround.close()
-        if wake is not None:
-            wake.close()
-        if listener is not None:
-            listener.close()
-        if audio is not None:
-            audio.close()
-        if tools_proc is not None:
-            tools_proc.terminate()
-            try:
-                tools_proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                tools_proc.kill()
+        devices.close()
+        stop_process(tools_proc)
 
 
 if __name__ == "__main__":

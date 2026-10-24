@@ -282,8 +282,10 @@ and the speakers (off unless `SHOW_VU_METER` in `tui/app.py` is set to True),
 and everything the chatbot prints goes to a log pane. The
 input box at the bottom replaces the `you>` prompt: Enter sends a line, an
 empty line records from the microphone, and all the `/commands` work. In
-`--wake-word` and `--hands-free` modes the input box is hidden because those
-modes never read it.
+`--wake-word` mode the box is there too: a typed line cuts the listening
+short and is taken instead of the microphone, which is the way to talk to
+the bot when the music is too loud for it to hear you (in `--hands-free`
+mode typing is not read).
 
 | The bot is...                   | The face                                                            |
 | ------------------------------- | ------------------------------------------------------------------- |
@@ -297,8 +299,15 @@ The VU meter shows dBFS of the last 100 ms: the microphone after the chatbot's
 own gain (so it is what the recognisers hear) and the speaker output, with a
 one second peak hold. Green is below -18 dB, amber to -6 dB, red above.
 
-Keys: **Esc** stops the current reply or speech (what Ctrl-C does in the plain
-terminal), **Ctrl-Q** quits.
+Keys: **Esc** stops the current reply or speech and anything playing on, a
+held note, the drums or a backing loop (what Ctrl-C does in the plain
+terminal); spoken "stop" is hard to hear over the music, so the key is the
+sure way. **Ctrl-Q** quits.
+
+When the bot did not understand, it does not say so: two falling notes (the
+`huh` cue) play instead, both when it could not make sense of a tool request
+and when the model's reply would have been an apology ("I'm sorry, I don't
+understand..."), which is then not read out at all.
 
 ### How the pieces talk: events/bus.py
 
@@ -475,8 +484,12 @@ which tools it can reach:
 | `music`        | drums, tempo, notes, stop                          | "let's do music", "let's do drums"    |
 | `home`         | the example server's lights and clock              | "let's do home", "home mode"          |
 
-"Exit" and "start over" work in every mode. Switching is recognised in the
-chat loop without a model call, like "stop": the bot says the mode's
+"Exit" and "start over" work in every mode. Music mode is *quiet*: what a
+tool did ("Played C sharp 5", "Tempo 110 from the next bar") is printed but
+not spoken, and "I will set tempo" is only said while nothing is playing
+yet, so the bot never talks over the notes and drums; ordinary replies are
+still spoken. Switching is recognised in the chat loop without a model call,
+like "stop": the bot says the mode's
 greeting ("Music mode. Drums, tempo and notes.") and the TUI's status line
 shows the mode. `--mode` picks the starting one.
 
@@ -539,7 +552,12 @@ has been heard before the tool runs, so a note or a held tone never starts
 under the announcement.
 
 `play_note` (in `audio/notes.py`) is another Python tool, registered only
-when the speakers are open: "play a note", "play me a C sharp" or "play B
+when the speakers are open. The notes are played on the piano of a General
+MIDI SoundFont (TimGM6mb, 6 MB, fetched once from Debian's archive into
+`assets/gm-soundfont.sf2`; any GM bank put there works), rendered by the
+same TinySoundFont as the drums inside the audio engine; a held note is
+struck again every 1.6 s, since a piano decays. If the bank cannot be
+loaded the old plain sine tone is used. "play a note", "play me a C sharp" or "play B
 flat 3 for two seconds" plays that note through the speakers, named the
 usual way (letter, sharp or flat, octave; `A4` is 440 Hz and the octave
 defaults to 4). `keep_playing_note` holds a note instead ("keep playing a
@@ -559,7 +577,7 @@ first use. The patterns live in `audio/patterns.py`, written as drum lanes
 one character per step (`x` a stroke, `X` an accent, `g` a ghost note), so
 adding one is a few lines: grooves in common styles (rock, pop, ballad,
 dance, shuffle, jazz, funk, hip-hop, reggae, bossa nova, a waltz in three,
-march, metal, punk, train), Latin and world grooves (salsa with its clave and
+march, metal, punk, train, drum and bass, breakbeat), Latin and world grooves (salsa with its clave and
 cascara, samba, afrobeat, the Afro-Cuban 6/8 bembe, cumbia, reggaeton, ska,
 bhangra, tango) and the standard rudiments on the snare (single and double
 stroke rolls, the paradiddles, five- and seven-stroke rolls, flams, flam
@@ -574,7 +592,20 @@ when asked; it is built when the chatbot starts, so a running chatbot has
 to be restarted to see new ones. The loop is a layer on the audio stream like the
 held note, mixed into the output under speech and cues (turned down by half
 while they play, so the words stay clear) inside the audio engine's own
-process, so it keeps time sample-accurately whatever the chatbot is doing. `set_tempo` changes the speed while it plays, "faster",
+process, so it keeps time sample-accurately whatever the chatbot is doing. `play_backing` (in `audio/backing.py`) turns the drums into a band to
+practise along to: "give me a backing track in A minor", "a blues in E", "a
+jazz backing in F at 140". The drums, a piano playing the diatonic chords of
+the key (struck on beats 1 and 3) and a bass playing their roots and fifths
+run on one bar clock at one tempo inside the engine (`audio/band.py`), so
+they stay locked together however they are started, stopped or changed.
+The harmony comes from a small theory module (`audio/theory.py`: keys,
+diatonic chords, progressions such as pop, rock, folk, ballad, twelve-bar
+blues, jazz ii-V-I, minor, andalusian, one chord) rather than music21, which
+is a large library for thirty lines of scale arithmetic. `set_mix` mutes,
+unmutes or solos a part: "mute the drums", "just the bass", "unmute the
+piano", so you can practise against whichever parts you like. The bot's
+replies name the chords ("Backing in A minor, minor: A minor, F, C, G").
+`set_tempo` changes the speed while it plays, "faster",
 "much slower" or "set the tempo to 100", and like a pattern or kit change it
 takes effect at the start of the next bar, as a drum machine would. "Stop"
 ends it; the bot keeps listening for that without the wake phrase, as for a

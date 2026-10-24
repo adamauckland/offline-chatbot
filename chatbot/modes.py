@@ -1,18 +1,3 @@
-"""Modes: which tools the bot can use right now, switched by saying so.
-
-The bot is in one mode at a time. ``chat`` (the default) has no tools; the
-others each open a few: ``photographer`` the webcam, ``music`` the notes and
-drums, ``home`` the example server's lights and clock. "Let's chat", "let's
-do photos", "let's do music", "let's do home" switch, handled in the chat loop
-without a model call, like "stop".
-
-Why modes: the routing question ("which tool, if any?") lists the available
-tools with an example each, so fewer tools means a shorter prompt and a
-quicker answer, and in chat mode the question is not asked at all. They
-also keep the small model from reaching for a tool nobody wanted. The
-control tools, ``exit`` and ``clear_context``, are available in every mode.
-"""
-
 from __future__ import annotations
 
 import re
@@ -21,16 +6,20 @@ from dataclasses import dataclass, field
 from tools import TOOLS, Tool
 
 DEFAULT_MODE = "chat"
-ALWAYS = ("exit", "clear_context")  # available whatever the mode
+ALWAYS = ("exit", "clear_context")
+LETS_DO = re.compile(r"lets (?:do|go|try|have) (?:some |the )?(\w+)")
+APOSTROPHE_S = re.compile(r"\blet['’]s\b")
+SPACES = re.compile(r"\s+")
 
 
 @dataclass(frozen=True)
 class Mode:
     name: str
-    tools: tuple[str, ...]  # tool names this mode opens, besides ALWAYS
-    phrases: tuple[str, ...]  # said on their own (or at the start of a line), these switch to it
-    greeting: str  # spoken on switching
-    extra: tuple[str, ...] = field(default_factory=tuple)  # words that, after "let's do", mean this mode
+    tools: tuple[str, ...]
+    phrases: tuple[str, ...]
+    greeting: str
+    extra: tuple[str, ...] = field(default_factory=tuple)
+    quiet: bool = False  # tool results are printed, not spoken, and no announcement over something playing
 
 
 MODES: dict[str, Mode] = {
@@ -50,10 +39,11 @@ MODES: dict[str, Mode] = {
     ),
     "music": Mode(
         "music",
-        ("play_drums", "set_tempo", "play_note", "keep_playing_note", "stop_sound"),
+        ("play_drums", "play_backing", "set_mix", "set_tempo", "play_note", "keep_playing_note", "stop_sound"),
         ("lets do music", "lets play music", "music mode", "lets make music"),
-        "Music mode. Drums, tempo and notes.",
+        "Music mode. Drums, backing loops, tempo and notes.",
         ("music", "drums", "beats"),
+        quiet=True,  # speech over the notes and drums is what the music is not for
     ),
     "home": Mode(
         "home",
@@ -63,45 +53,6 @@ MODES: dict[str, Mode] = {
         ("home", "house", "lights"),
     ),
 }
-
-
-def _normalise(line: str) -> str:
-    text = line.lower().strip().strip(" .,!?")
-    text = re.sub(r"\blet['’]s\b", "lets", text)
-    return re.sub(r"\s+", " ", text)
-
-
-def detect_switch(line: str) -> str | None:
-    """The mode ``line`` asks for, or None. Matches a phrase on its own or opening the line."""
-    text = _normalise(line)
-    if not text:
-        return None
-    for mode in MODES.values():
-        for phrase in mode.phrases:
-            if text == phrase or text.startswith(phrase + " "):
-                return mode.name
-    match = re.match(r"lets (?:do|go|try|have) (?:some |the )?(\w+)", text)
-    if match:
-        word = match.group(1)
-        for mode in MODES.values():
-            if word in mode.extra:
-                return mode.name
-    return None
-
-
-def allowed_tools(mode: str) -> list[Tool]:
-    """The registered tools the mode opens, in registry order, plus the control tools."""
-    names = set(MODES[mode].tools) | set(ALWAYS)
-    return [tool for tool in TOOLS if tool.name in names]
-
-
-def mode_for_tool(name: str) -> str | None:
-    """The mode that opens tool ``name`` (None for the control tools and unknown names)."""
-    for mode in MODES.values():
-        if name in mode.tools:
-            return mode.name
-    return None
-
 
 YES_WORDS = {
     "yes",
@@ -136,13 +87,74 @@ NO_WORDS = {
 }
 
 
+def normalise(line: str) -> str:
+    text = line.lower().strip().strip(" .,!?")
+    text = APOSTROPHE_S.sub("lets", text)
+
+    return SPACES.sub(" ", text)
+
+
+def detect_switch(line: str) -> str | None:
+    text = normalise(line)
+
+    if not text:
+        return None
+
+    return mode_by_phrase(text) or mode_by_lets_do(text)
+
+
+def mode_by_phrase(text: str) -> str | None:
+    for mode in MODES.values():
+        for phrase in mode.phrases:
+            if text == phrase or text.startswith(phrase + " "):
+                return mode.name
+
+    return None
+
+
+def mode_by_lets_do(text: str) -> str | None:
+    match = LETS_DO.match(text)
+
+    if not match:
+        return None
+
+    word = match.group(1)
+
+    for mode in MODES.values():
+        if word in mode.extra:
+            return mode.name
+
+    return None
+
+
+def allowed_tools(mode: str) -> list[Tool]:
+    names = set(MODES[mode].tools) | set(ALWAYS)
+
+    return [tool for tool in TOOLS if tool.name in names]
+
+
+def is_quiet(mode: str) -> bool:
+    """Whether tool results in ``mode`` go unspoken (see ``Mode.quiet``)."""
+    return mode in MODES and MODES[mode].quiet
+
+
+def mode_for_tool(name: str) -> str | None:
+    for mode in MODES.values():
+        if name in mode.tools:
+            return mode.name
+
+    return None
+
+
 def answer_to_offer(line: str) -> str | None:
-    """Whether ``line`` accepts ("yes") or declines ("no") an offer to switch mode; None if it is something else."""
-    text = _normalise(line)
+    text = normalise(line)
+
     if text in YES_WORDS or text.startswith("yes"):
         return "yes"
+
     if text in NO_WORDS or text.startswith("no"):
         return "no"
+
     return None
 
 

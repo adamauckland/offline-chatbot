@@ -1,23 +1,9 @@
-"""Kyutai STT 1B on MLX: a streaming recogniser, run as a helper in its own environment.
-
-Kyutai's ``moshi-mlx`` package pins a huggingface-hub this project cannot use
-(memory's model2vec needs a newer one), so ``kyutai_helper.py`` runs under
-``uv run --no-project --with moshi-mlx``: uv builds that environment once and
-caches it, and the model (about 2.5 GB, ``kyutai/stt-1b-en_fr-mlx``) is
-downloaded once by huggingface-hub.
-
-The model transcribes at about 1.8 times real time here, so as a batch step it
-would add seconds; it earns its place by streaming. Frames are sent while you
-speak, and the text is ready about half a second (the model's delay) after you
-stop. English and French. Needs Apple silicon and ``uv`` on the PATH.
-"""
-
 from __future__ import annotations
 
-import platform
 import shutil
 from pathlib import Path
 
+from audio.stt.base import apple_silicon
 from audio.stt.helper import PipeTranscriber
 
 DEFAULT_MODEL = "kyutai/stt-1b-en_fr-mlx"
@@ -26,22 +12,26 @@ MOSHI_MLX = "moshi-mlx>=0.2.6"
 
 
 def available() -> tuple[bool, str]:
-    if platform.system() != "Darwin" or platform.machine() != "arm64":
+    if not apple_silicon():
         return False, "needs Apple silicon (MLX)"
+
     if shutil.which("uv") is None:
         return False, "needs uv on the PATH to run the helper in its own environment"
+
     return True, ""
+
+
+def helper_command(model: str) -> list[str]:
+    isolated_python = ["uv", "run", "--no-project", "--python", "3.12", "--with", MOSHI_MLX, "python"]
+
+    return isolated_python + [str(HELPER), "--hf-repo", model]
 
 
 class KyutaiSTT(PipeTranscriber):
     name = "kyutai"
     streaming = True
-    ready_timeout = 1800.0  # the first start builds the environment and downloads the model
+    ready_timeout = 1800.0
 
     def __init__(self, model: str | None = None) -> None:
         self.model = model or DEFAULT_MODEL
-        command = [
-            "uv", "run", "--no-project", "--python", "3.12", "--with", MOSHI_MLX,
-            "python", str(HELPER), "--hf-repo", self.model,
-        ]  # fmt: skip
-        super().__init__(command)
+        super().__init__(helper_command(self.model))

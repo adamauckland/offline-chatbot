@@ -1,26 +1,3 @@
-"""Loading Phi-3.5-vision and generating one reply from it, reusing the model's cache across turns.
-
-Every turn re-sends the whole conversation to the model. Without help that
-means re-encoding all of it each time, about 1.3 s for a short chat and more
-as it grows, with a picture costing hundreds of tokens every turn. A
-``Session`` keeps the model's key/value cache alive between calls and
-remembers which token ids are in it: the next prompt is tokenised, the
-longest prefix it shares with the cache is kept, and only the rest is fed
-to the model. The cache is rewound rather than cleared, so an interrupted
-reply or a dropped picture just means encoding from the point of difference.
-
-There are three sessions, since each prompt family has a constant prefix:
-the chat itself, the "which tool?" question and the fact extraction. The
-``Engine`` holds them with the model and processor.
-
-The forward pass here mirrors the library's ``Phi3F.__call__`` (phi.py) with
-our own cache, mask and rotary tables, because the library ties the mask and
-tables to one cache created per call. Decoding is greedy, so a cached turn
-must produce exactly the tokens an uncached one would; ``chat_once`` with
-``session=None`` is that uncached path, kept as the fallback for prompts
-that do not fit the cache.
-"""
-
 from __future__ import annotations
 
 import os
@@ -29,56 +6,53 @@ from collections.abc import Callable
 import mlx.core as mx
 import numpy as np
 
-# Silence transformers' "PyTorch was not found" notice; MLX does the inference.
-os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
-import phi_3_vision_mlx as pv  # noqa: E402
-from phi import SuRoPE  # noqa: E402 - the library's rotary tables, built once per session
 
-import events  # noqa: E402
-from chatbot.conversation import END, Conversation, clean_reply  # noqa: E402
-from tools import parse_tool_call  # noqa: E402
+def silence_transformers_notices() -> None:
+    os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+
+
+silence_transformers_notices()
+
+import phi_3_vision_mlx as pv
+from phi import SuRoPE
+
+import events
+from chatbot.conversation import END, Conversation, clean_reply
+from tools import parse_tool_call
 
 REPO_ID = "microsoft/Phi-3.5-vision-instruct"
-# Tiles per picture. The library resizes every image to this grid whatever its size, so this,
-# not the input resolution, sets the cost: 16 tiles are ~2350 prompt tokens per picture, 4 are
-# ~750, 1 is ~310, and the whole conversation (pictures included) is re-encoded every turn.
 DEFAULT_IMAGE_CROPS = 4
-# Tokens the chat session's cache can hold (1.6 GB at 4096). Not more than 4096: beyond the
-# model's original context the library switches rotary scaling, which would change every reply.
 CACHE_TOKENS = 4096
-SIDE_CACHE_TOKENS = 1024  # the router and extractor prompts are short
+SIDE_CACHE_TOKENS = 1024
+TRIM_TO = 0.6
 
 
 class LayerCache:
-    """One layer's key/value store: the library's ``KVCache`` interface, but persistent and rewindable."""
-
     def __init__(self, capacity: int) -> None:
         self.capacity = capacity
         self.offset = 0
         self.kv: mx.array | None = None
 
-    def __call__(self, keys: mx.array, values: mx.array, n_beam: int) -> tuple[mx.array, mx.array]:  # noqa: ARG002
+    def __call__(self, keys: mx.array, values: mx.array, n_beam: int) -> tuple[mx.array, mx.array]:
         if self.kv is None:
             b, heads, _, dim = keys.shape
             self.kv = mx.zeros((2, b, heads, self.capacity, dim), dtype=keys.dtype)
+
         end = self.offset + keys.shape[2]
         self.kv[0, :, :, self.offset : end, :] = keys
         self.kv[1, :, :, self.offset : end, :] = values
         self.offset = end
+
         return self.kv[0, :, :, :end, :], self.kv[1, :, :, :end, :]
 
 
 class Session:
-    """The model's cache for one prompt family, with the token ids it holds."""
-
     def __init__(self, model, capacity: int) -> None:
         self.model = model
         self.capacity = capacity
         self.layers = model.model.layers
         self.caches = [LayerCache(capacity) for _ in self.layers]
-        self.ids: list[int] = []  # what the cache holds; negative ids stand for image tokens, as in the library
-        # The picture objects encoded so far, by picture number. Two different pictures of the
-        # same shape produce the same token run, so the ids alone cannot tell them apart.
+        self.ids: list[int] = []
         self.pictures: dict[int, object] = {}
         self.rope = SuRoPE(model.config, capacity, None)
 
@@ -89,6 +63,7 @@ class Session:
     def rewind(self, n: int) -> None:
         for cache in self.caches:
             cache.offset = n
+
         del self.ids[n:]
         kept = {-token for token in self.ids if token < 0}
         self.pictures = {number: picture for number, picture in self.pictures.items() if number in kept}
@@ -97,70 +72,96 @@ class Session:
         self.rewind(0)
 
     def forward(self, ids: list[int], pixel_values=None, image_sizes=None, positions=None) -> mx.array:
-        """Feed ``ids`` after what is cached; returns the logits for the token that follows them."""
         model = self.model.model
         past, new = self.length, len(ids)
+
         if past + new > self.capacity:
             raise OverflowError("session cache is full")
+
         x = model.embed_tokens(mx.array(ids)[None])
+
         if pixel_values is not None:
             x = model.vision_embed_tokens(x, pixel_values, image_sizes, positions)
+
         mask = mx.triu(mx.full((new, past + new), -mx.inf), k=past + 1)[None, None]
         cos, sin = self.rope(past, new)
+
         for layer, cache in zip(self.layers, self.caches):
             x = layer(x, cache, cos, sin, mask, 1)
+
         self.ids.extend(ids)
+
         return self.model.lm_head(model.norm(x))[:, -1, :]
 
     def prepare(self, inputs: dict, pictures: list, reserve: int) -> mx.array | None:
-        """Rewind to the prefix shared with ``inputs``, feed the rest, and return the next-token logits.
+        ids = token_ids(inputs)
 
-        ``pictures`` are the conversation's picture objects, in number order.
-        None when the prompt plus ``reserve`` tokens of reply would not fit.
-        The last prompt token is always fed again, so there are logits even
-        when the whole prompt is already cached (after an interrupted reply).
-        """
-        ids = [int(i) for i in np.asarray(inputs["input_ids"][0]).tolist()]
         if len(ids) + reserve > self.capacity:
             return None
-        common = 0
-        for a, b in zip(self.ids, ids):
-            if a != b or (b < 0 and self.pictures.get(-b) is not pictures[-b - 1]):
-                break  # a different token, or the same picture number but another picture
-            common += 1
-        common = min(common, len(ids) - 1)
-        while common > 0 and ids[common] < 0 and ids[common - 1] == ids[common]:
-            common -= 1  # never cut inside a picture's run of tokens
+
+        common = self._shared_prefix_length(ids, pictures)
         self.rewind(common)
         suffix = ids[common:]
+        self._note_pictures(suffix, pictures)
+        logits = self.forward(suffix, *images_in(suffix, inputs))
+        mx.eval(logits)
+
+        return logits
+
+    def _shared_prefix_length(self, ids: list[int], pictures: list) -> int:
+        common = 0
+
+        for cached, wanted in zip(self.ids, ids):
+            if cached != wanted or self._is_another_picture(wanted, pictures):
+                break
+
+            common += 1
+
+        return back_out_of_picture_run(ids, min(common, len(ids) - 1))
+
+    def _is_another_picture(self, token: int, pictures: list) -> bool:
+        return token < 0 and self.pictures.get(-token) is not pictures[-token - 1]
+
+    def _note_pictures(self, suffix: list[int], pictures: list) -> None:
         for token in suffix:
             if token < 0:
                 self.pictures[-token] = pictures[-token - 1]
-        logits = self.forward(suffix, *_images_in(suffix, inputs))
-        mx.eval(logits)  # MLX is lazy: do the encoding now, not when the first token is sampled
-        return logits
 
 
-def _images_in(suffix: list[int], inputs: dict):
-    """The pictures whose tokens lie in ``suffix``, with positions relative to it, for ``forward``.
+def token_ids(inputs: dict) -> list[int]:
+    return [int(i) for i in np.asarray(inputs["input_ids"][0]).tolist()]
 
-    The library places pictures into their token runs in order, so the
-    selection only has to keep the order of first appearance.
-    """
-    wanted: list[int] = []  # picture numbers, 1-based
-    for token in suffix:
-        if token < 0 and -token not in wanted:
-            wanted.append(-token)
+
+def back_out_of_picture_run(ids: list[int], common: int) -> int:
+    while common > 0 and ids[common] < 0 and ids[common - 1] == ids[common]:
+        common -= 1
+
+    return common
+
+
+def images_in(suffix: list[int], inputs: dict):
+    wanted = picture_numbers_in_order(suffix)
+
     if not wanted:
         return None, None, None
+
     pick = mx.array([n - 1 for n in wanted])
     positions = mx.array([[0, i] for i, token in enumerate(suffix) if token < 0])
+
     return inputs["pixel_values"][pick], inputs["image_sizes"][pick], positions
 
 
-class Engine:
-    """The loaded model and processor, plus a cache session for each kind of prompt."""
+def picture_numbers_in_order(suffix: list[int]) -> list[int]:
+    wanted: list[int] = []
 
+    for token in suffix:
+        if token < 0 and -token not in wanted:
+            wanted.append(-token)
+
+    return wanted
+
+
+class Engine:
     def __init__(self, preload, cache_tokens: int = CACHE_TOKENS) -> None:
         self.model, self.processor = preload
         cache_tokens = max(0, min(cache_tokens, CACHE_TOKENS))
@@ -169,48 +170,155 @@ class Engine:
         self.router = Session(self.model, side) if cache_tokens else None
         self.extractor = Session(self.model, side) if cache_tokens else None
 
-    def __iter__(self):  # so ``model, processor = engine`` works like the old (model, processor) pair
+    def __iter__(self):
         return iter((self.model, self.processor))
 
 
 def load_model(
     quantize: bool = True, image_crops: int = DEFAULT_IMAGE_CROPS, cache_tokens: int = CACHE_TOKENS
 ) -> Engine:
-    """Load the model and processor; ``cache_tokens=0`` re-encodes every prompt in full."""
     preload = pv.load(repo_id=REPO_ID, quantize_model=quantize)
     preload[1].img_processor.num_crops = max(1, image_crops)
+
     return Engine(preload, cache_tokens)
 
 
-TRIM_TO = 0.6  # when a conversation outgrows the cache, drop old exchanges down to this share of it
+def encode(processor, convo: Conversation, extra_system: str, prefill: str, note: str) -> dict:
+    return processor(convo.prompt(extra_system, prefill, note), convo.images or None)
+
+
+def prompt_length(inputs: dict) -> int:
+    return inputs["input_ids"].shape[-1]
 
 
 def trim_to_fit(
     engine, convo: Conversation, session: Session, reserve: int, extra_system: str, prefill: str, note: str
 ) -> int:
-    """Drop the oldest exchanges until the prompt plus ``reserve`` tokens fits the session's cache.
-
-    Dropping invalidates the cache from the system prompt on, so when it has
-    to happen it drops down to ``TRIM_TO`` of the capacity in one go: one
-    re-encode of the remaining turns every so often, instead of a full one
-    on every turn once the cap is reached. Returns how many exchanges went.
-    """
     _, processor = engine
 
-    def tokens() -> int:  # the processor's own count, pictures expanded to their tiles
-        return processor(convo.prompt(extra_system, prefill, note), convo.images or None)["input_ids"].shape[-1]
+    def prompt_tokens() -> int:
+        return prompt_length(encode(processor, convo, extra_system, prefill, note))
 
-    if tokens() + reserve <= session.capacity:
+    if prompt_tokens() + reserve <= session.capacity:
         return 0
+
     dropped = 0
-    while tokens() + reserve > TRIM_TO * session.capacity and convo.drop_oldest_exchange():
+
+    while prompt_tokens() + reserve > TRIM_TO * session.capacity and convo.drop_oldest_exchange():
         dropped += 1
+
     if dropped:
         print(
             f"(forgetting the oldest {dropped} exchange(s) to keep the conversation inside the model's cache)",
             flush=True,
         )
+
     return dropped
+
+
+class SessionDecoder:
+    def __init__(self, session: Session, logits: mx.array) -> None:
+        self.session = session
+        self.logits = logits
+
+    def step(self, token: mx.array) -> None:
+        self.logits = self.session.forward([token.item()])
+
+
+class LibraryDecoder:
+    def __init__(self, model, inputs: dict, max_tokens: int) -> None:
+        self.model = model
+        logits, self.cache = model(**inputs, max_tokens=max_tokens)
+        self.logits = logits[:, -1, :]
+
+    def step(self, token: mx.array) -> None:
+        logits, self.cache = self.model(input_ids=token[:, None], cache=self.cache)
+        self.logits = logits[:, -1, :]
+
+
+def decoder_for(
+    engine, convo: Conversation, max_tokens: int, extra_system: str, prefill: str, note: str, session: Session | None
+) -> SessionDecoder | LibraryDecoder:
+    model, processor = engine
+    inputs = encode(processor, convo, extra_system, prefill, note)
+
+    if session is not None and prompt_length(inputs) + max_tokens > session.capacity:
+        if trim_to_fit(engine, convo, session, max_tokens, extra_system, prefill, note):
+            inputs = encode(processor, convo, extra_system, prefill, note)
+
+    logits = session.prepare(inputs, convo.images, max_tokens) if session is not None else None
+
+    if logits is None:
+        return LibraryDecoder(model, inputs, max_tokens)
+
+    return SessionDecoder(session, logits)
+
+
+def tool_call_start(text: str) -> int:
+    brace = text.find("{")
+
+    if brace == -1:
+        return -1
+
+    fence = text.find("```")
+
+    return brace if fence == -1 else min(brace, fence)
+
+
+def safe_to_show(text: str, use_tools: bool) -> int:
+    cut = text.rfind(" ")
+    hold = tool_call_start(text) if use_tools else -1
+
+    if hold != -1:
+        cut = min(cut, len(text[:hold].rstrip()))
+
+    return cut
+
+
+def is_complete_tool_call(text: str, use_tools: bool) -> bool:
+    if not use_tools or "{" not in text or not text.rstrip().endswith("}"):
+        return False
+
+    return parse_tool_call(text) is not None
+
+
+class ReplyPrinter:
+    def __init__(self, quiet: bool, use_tools: bool, on_text: Callable[[str], None] | None) -> None:
+        self.quiet = quiet
+        self.use_tools = use_tools
+        self.on_text = on_text
+        self.printed = 0
+
+    def show(self, text: str) -> None:
+        if self.quiet:
+            return
+
+        cut = safe_to_show(text, self.use_tools)
+
+        if cut > self.printed:
+            self._emit(text[self.printed : cut])
+            self.printed = cut
+
+    def finish(self, text: str, prefill: str) -> None:
+        if self.quiet:
+            return
+
+        if self.use_tools and (prefill or parse_tool_call(text)):
+            self._end_line_if_started()
+            return
+
+        self._emit(text[self.printed :])
+        print("\n", flush=True)
+
+    def _emit(self, piece: str) -> None:
+        print(piece, end="", flush=True)
+
+        if self.on_text is not None:
+            self.on_text(piece)
+
+    def _end_line_if_started(self) -> None:
+        if self.printed:
+            print(flush=True)
 
 
 def chat_once(
@@ -225,81 +333,33 @@ def chat_once(
     session: Session | None = None,
     note: str = "",
 ) -> str:
-    """Generate one assistant reply, streaming words to stdout as they arrive.
-
-    This is a trimmed-down version of the library's own generation loop: greedy
-    decoding with a KV cache, stopping at <|end|>. Writing it here (instead of
-    calling ``pv.generate``) lets us hide the end-of-turn token and keeps the
-    terminal output clean.
-
-    With ``use_tools`` the loop also stops as soon as a complete tool-call JSON
-    object has been produced (otherwise small models tend to carry on and make
-    up the tool's result), and nothing from the first "{" onward is printed.
-
-    ``on_text`` receives the same pieces of text as they are printed (whole
-    words, never tool-call JSON), so the reply can be spoken while it is
-    still being generated. With a ``session`` only the part of the prompt
-    that is not already cached is encoded. ``note`` is text rendered into the
-    last user turn for this call only (the recalled memories).
-    """
-    model, processor = engine
+    _, processor = engine
     tokenizer = processor.tokenizer
     eos_id = tokenizer.encode(END)[-1]
-
-    inputs = processor(convo.prompt(extra_system, prefill, note), convo.images or None)
-    if session is not None and inputs["input_ids"].shape[-1] + max_tokens > session.capacity:
-        if trim_to_fit(engine, convo, session, max_tokens, extra_system, prefill, note):
-            inputs = processor(convo.prompt(extra_system, prefill, note), convo.images or None)
-    logits = session.prepare(inputs, convo.images, max_tokens) if session is not None else None
-    cache = None
-    if logits is None:  # no session, or the prompt does not fit it: the library's one-call cache
-        session = None
-        logits, cache = model(**inputs, max_tokens=max_tokens)
-        logits = logits[:, -1, :]
-
+    decoder = decoder_for(engine, convo, max_tokens, extra_system, prefill, note, session)
+    printer = ReplyPrinter(quiet, use_tools, on_text)
     tokens: list[int] = []
-    printed = 0
+
     for _ in range(max_tokens):
         if events.CANCEL.is_set():
-            raise KeyboardInterrupt  # a display asked to stop: same path as Ctrl-C
-        token = mx.argmax(logits, axis=-1)
+            raise KeyboardInterrupt
+
+        token = mx.argmax(decoder.logits, axis=-1)
         mx.eval(token)
-        token_id = token.item()
-        if token_id == eos_id:
+
+        if token.item() == eos_id:
             break
-        tokens.append(token_id)
+
+        tokens.append(token.item())
         text = prefill + tokenizer.decode(tokens)
-        # Print up to the last space so partial multi-token words are not shown yet,
-        # and never print from the first "{" (or a ```json fence) on when it might be a tool call.
-        cut = text.rfind(" ")
-        brace = text.find("{") if use_tools else -1
-        if brace != -1:
-            fence = text.find("```")
-            hold = brace if fence == -1 else min(brace, fence)
-            cut = min(cut, len(text[:hold].rstrip()))
-        if cut > printed and not quiet:
-            print(text[printed:cut], end="", flush=True)
-            if on_text is not None:
-                on_text(text[printed:cut])
-            printed = cut
-        if brace != -1 and text.rstrip().endswith("}") and parse_tool_call(text):
+        printer.show(text)
+
+        if is_complete_tool_call(text, use_tools):
             break
-        if session is not None:
-            logits = session.forward([token_id])
-        else:
-            logits, cache = model(input_ids=token[:, None], cache=cache)
-            logits = logits[:, -1, :]
+
+        decoder.step(token)
 
     text = prefill + tokenizer.decode(tokens)
-    if quiet:
-        pass
-    elif use_tools and (prefill or parse_tool_call(text)):
-        # A tool call (or a botched attempt at one after a prefill) is never shown.
-        if printed:
-            print(flush=True)
-    else:
-        print(text[printed:], flush=True)
-        print()
-        if on_text is not None:
-            on_text(text[printed:])
+    printer.finish(text, prefill)
+
     return clean_reply(text)

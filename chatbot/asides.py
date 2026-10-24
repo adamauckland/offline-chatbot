@@ -1,10 +1,3 @@
-"""Quiet side questions to the model: which tool a message needs, and whether it states a fact.
-
-Both are short, separate generations with nothing printed. Small models answer
-a direct question far more reliably than they follow a standing instruction
-buried in a long system prompt, which is why these exist.
-"""
-
 from __future__ import annotations
 
 import re
@@ -20,79 +13,6 @@ ROUTE_PROMPT = (
     "Examples: {examples}; 'where do I live' -> NONE; 'hello' -> NONE; 'tell me a joke' -> NONE.\n\n"
     "Message: {message}\nAnswer with one word, the tool name or NONE:"
 )
-
-
-def route_prompt(tools: list[Tool], message: str) -> str:
-    """The routing question for just these tools, with an example per tool taken from its ``example``."""
-    lines = "\n".join(t.describe(brief=True) for t in tools)
-    examples = "; ".join(f"'{t.example[0]}' -> {t.name}" for t in tools if t.example)
-    return ROUTE_PROMPT.format(tools=lines, examples=examples, message=message)
-
-
-_warned: set[str] = set()
-
-
-def _check_fits(engine, session, prompt: str, what: str) -> None:
-    """Warn once if a side prompt has outgrown its cache: it then re-encodes in full on every turn."""
-    if session is None or what in _warned:
-        return
-    _, processor = engine
-    n = len(processor.tokenizer.encode(prompt))
-    if n + 40 > session.capacity:
-        _warned.add(what)
-        print(
-            f"(the {what} prompt is {n} tokens, more than its cache of {session.capacity}: every turn will "
-            "re-encode it in full; shorten the tool descriptions or raise SIDE_CACHE_TOKENS)",
-            flush=True,
-        )
-
-
-def warm_up(engine, system: str | None, tools: list[Tool] | None = None) -> None:
-    """Encode the constant prefixes now, so the first turn is as quick as the rest.
-
-    The chat session gets the system prompt, the router its question with the
-    tool list of the current mode; the first real turn then diverges only at
-    the message.
-    """
-    tools = list(TOOLS) if tools is None else tools
-    for session, prompt in (
-        (getattr(engine, "chat", None), Conversation(system).prompt()),
-        (getattr(engine, "router", None), Conversation().add_user_and_prompt(route_prompt(tools, "")) if tools else ""),
-    ):
-        if session is None or not prompt:
-            continue
-        _, processor = engine
-        inputs = processor(prompt, None)
-        if inputs["input_ids"].shape[-1] + 64 <= session.capacity:
-            session.prepare(inputs, [], 64)
-
-
-def route_tool(engine, message: str, tools: list[Tool] | None = None) -> str | None:
-    """Ask the model, in a quiet call, which of ``tools`` (all registered ones if None) the message needs.
-
-    With no tools to choose from there is nothing to ask: None straight away.
-
-    Small models drift out of "reply with JSON" mode after a few turns of
-    chat, especially once they have described themselves as a mere program. A
-    direct pick-a-name question is answered reliably, and the chosen tool's
-    JSON is then pre-filled so only the arguments are left to generate.
-    """
-    tools = list(TOOLS) if tools is None else tools
-    if not tools:
-        return None
-    probe = Conversation()
-    probe.add_user(route_prompt(tools, message), [])
-    session = getattr(engine, "router", None)
-    _check_fits(engine, session, probe.prompt(), "routing")
-    reply = chat_once(engine, probe, max_tokens=12, quiet=True, session=session).strip().lower()
-    for tool in sorted(tools, key=lambda t: len(t.name), reverse=True):  # longest name first: "set_tempo" before "set"
-        if tool.name in reply:
-            return tool.name
-    return None
-
-
-PERSONAL = re.compile(r"\b(i|i'm|i am|i've|my|mine|remember)\b", re.I)
-NOT_A_FACT = re.compile(r"\b(ask|asked|asks|request|did not|didn't|wants? (you|me) to)\b", re.I)
 EXTRACT_PROMPT = (
     "Does the message below state a lasting fact about the user: their name, where they live, "
     "their family or pets, what they like, their plans, or something they asked you to remember? "
@@ -101,26 +21,96 @@ EXTRACT_PROMPT = (
     "the user: reply NONE for those. "
     "If no, reply with exactly NONE.\n\nMessage: {message}"
 )
+PERSONAL = re.compile(r"\b(i|i'm|i am|i've|my|mine|remember)\b", re.I)
+NOT_A_FACT = re.compile(r"\b(ask|asked|asks|request|did not|didn't|wants? (you|me) to)\b", re.I)
+ROUTE_MAX_TOKENS = 12
+EXTRACT_MAX_TOKENS = 40
+WARM_UP_RESERVE_TOKENS = 64
+SIDE_PROMPT_HEADROOM_TOKENS = 40
+
+_cache_warnings_given: set[str] = set()
+
+
+def route_prompt(tools: list[Tool], message: str) -> str:
+    lines = "\n".join(t.describe(brief=True) for t in tools)
+    examples = "; ".join(f"'{t.example[0]}' -> {t.name}" for t in tools if t.example)
+
+    return ROUTE_PROMPT.format(tools=lines, examples=examples, message=message)
+
+
+def warn_once_if_prompt_outgrows_cache(engine, session, prompt: str, what: str) -> None:
+    if session is None or what in _cache_warnings_given:
+        return
+
+    _, processor = engine
+    n = len(processor.tokenizer.encode(prompt))
+
+    if n + SIDE_PROMPT_HEADROOM_TOKENS <= session.capacity:
+        return
+
+    _cache_warnings_given.add(what)
+    print(
+        f"(the {what} prompt is {n} tokens, more than its cache of {session.capacity}: every turn will "
+        "re-encode it in full; shorten the tool descriptions or raise SIDE_CACHE_TOKENS)",
+        flush=True,
+    )
+
+
+def warm_up(engine, system: str | None, tools: list[Tool] | None = None) -> None:
+    tools = list(TOOLS) if tools is None else tools
+    prime(engine, getattr(engine, "chat", None), Conversation(system).prompt())
+
+    if tools:
+        prime(engine, getattr(engine, "router", None), Conversation().add_user_and_prompt(route_prompt(tools, "")))
+
+
+def prime(engine, session, prompt: str) -> None:
+    if session is None or not prompt:
+        return
+
+    _, processor = engine
+    inputs = processor(prompt, None)
+
+    if inputs["input_ids"].shape[-1] + WARM_UP_RESERVE_TOKENS <= session.capacity:
+        session.prepare(inputs, [], WARM_UP_RESERVE_TOKENS)
+
+
+def route_tool(engine, message: str, tools: list[Tool] | None = None) -> str | None:
+    tools = list(TOOLS) if tools is None else tools
+
+    if not tools:
+        return None
+
+    probe = Conversation()
+    probe.add_user(route_prompt(tools, message), [])
+    session = getattr(engine, "router", None)
+    warn_once_if_prompt_outgrows_cache(engine, session, probe.prompt(), "routing")
+    reply = chat_once(engine, probe, max_tokens=ROUTE_MAX_TOKENS, quiet=True, session=session).strip().lower()
+
+    for tool in longest_name_first(tools):
+        if tool.name in reply:
+            return tool.name
+
+    return None
+
+
+def longest_name_first(tools: list[Tool]) -> list[Tool]:
+    return sorted(tools, key=lambda t: len(t.name), reverse=True)
 
 
 def extract_fact(engine, message: str) -> str | None:
-    """Ask the model, in a separate quiet call, whether ``message`` holds a fact worth keeping.
-
-    Small models will not reliably call a "remember" tool, but they answer a
-    direct yes/no extraction question well. Only messages that look personal
-    (first person, or the word "remember") are checked, to keep latency down.
-    """
     if message.rstrip().endswith("?") or not PERSONAL.search(message):
         return None
+
     probe = Conversation()
     probe.add_user(EXTRACT_PROMPT.format(message=message), [])
-    reply = (
-        chat_once(engine, probe, max_tokens=40, quiet=True, session=getattr(engine, "extractor", None))
-        .splitlines()[0]
-        .strip()
-    )
+    session = getattr(engine, "extractor", None)
+    reply = chat_once(engine, probe, max_tokens=EXTRACT_MAX_TOKENS, quiet=True, session=session).splitlines()[0].strip()
+
     if not reply.lower().startswith("the user") or "[" in reply or "none" in reply.lower():
         return None
+
     if NOT_A_FACT.search(reply):
         return None
+
     return reply.rstrip(".") + "."

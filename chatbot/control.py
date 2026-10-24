@@ -1,9 +1,3 @@
-"""The two built-in tools that steer the chat loop itself: "exit" and "clear_context".
-
-Both only raise a flag; the loop acts on it once the current reply is out.
-One ``Control`` object is shared by the tools, ``answer`` and ``run_repl``.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -12,34 +6,27 @@ import requests
 
 from tools import BASE_URL, Tool, register
 
+SHUTDOWN_TIMEOUT_SECONDS = 2
+
 
 @dataclass
 class Control:
-    exit_requested: bool = False  # the chat loop ends after the goodbye
-    reset_requested: bool = False  # the chat loop starts a fresh conversation after the reply
-    wanted_mode: str | None = None  # the turn needed a tool from this mode: the loop offers to switch
+    exit_requested: bool = False
+    reset_requested: bool = False
+    wanted_mode: str | None = None
 
     def request_exit(self) -> dict:
-        """The "exit" tool: stop the tools server (even one we did not start) and flag the loop to end."""
         self.exit_requested = True
-        try:
-            requests.post(f"{BASE_URL}/shutdown", timeout=2)
-            server = "tools server stopping"
-        except requests.RequestException:
-            server = "no tools server to stop"
+        server = stop_tools_server()
+
         return {"ok": True, "message": f"Shutting down; {server}."}
 
     def request_reset(self) -> dict:
-        """The "clear_context" tool: forget the conversation so far (text and images), as /reset does.
-
-        Long-term memory is untouched; the exchanges so far simply become
-        recallable history.
-        """
         self.reset_requested = True
+
         return {"ok": True, "message": "The conversation will be cleared."}
 
     def register_tools(self) -> None:
-        """Offer both tools to the model."""
         register(
             Tool(
                 name="exit",
@@ -59,3 +46,12 @@ class Control:
                 example=("start over", {}),
             )
         )
+
+
+def stop_tools_server() -> str:
+    try:
+        requests.post(f"{BASE_URL}/shutdown", timeout=SHUTDOWN_TIMEOUT_SECONDS)
+
+        return "tools server stopping"
+    except requests.RequestException:
+        return "no tools server to stop"

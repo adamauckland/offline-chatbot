@@ -106,6 +106,22 @@ GROOVES: dict[str, Pattern] = {
     "march": _bar(8, kick="x... x...", snare="Xxxx Xxxx", crash="x... ...."),
     "metal": _bar(16, bpm=160, kick="xxxx xxxx xxxx xxxx", snare=".... x... .... x...", ride="x.x. x.x. x.x. x.x."),
     "train": _bar(16, kick="x... x... x... x...", snare="XxXx XxXx XxXx XxXx", hat="x... x... x... x..."),
+    "drum_and_bass": _bar(  # the two-step: kick on 1 and the "and" of 3, snare on 2 and 4, fast
+        16,
+        bpm=174,
+        kick="x... .... ..x. ....",
+        snare=".... x..g .... x..g",
+        hat="x.x. x.x. x.x. x.x.",
+        open_hat=".... .... .... ..x.",
+    ),
+    "breakbeat": _bar(  # a funky break: syncopated kick, ghosted snare, 16th hats
+        16,
+        bpm=135,
+        kick="x... ..x. .x.. x...",
+        snare=".... x..g .g.. x...",
+        hat="xxxx xxxx xxxx xxxx",
+        open_hat=".... .... .... ...x",
+    ),
     # Latin and world. Clave and bell patterns go on the side stick and cowbell, congas and
     # dhol on the toms: what a kit drummer does with them.
     "salsa": _bar(
@@ -193,6 +209,15 @@ ALIASES: dict[str, str] = {
     "simple": "rock",
     "double kick": "metal",
     "hardcore": "punk",
+    "dnb": "drum_and_bass",
+    "d and b": "drum_and_bass",
+    "drum n bass": "drum_and_bass",
+    "drum and base": "drum_and_bass",
+    "jungle": "drum_and_bass",
+    "break beat": "breakbeat",
+    "breaks": "breakbeat",
+    "big beat": "breakbeat",
+    "amen": "breakbeat",
     "d-beat": "punk",
     "mambo": "salsa",
     "clave": "salsa",

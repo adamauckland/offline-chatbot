@@ -60,8 +60,8 @@ class AudioEngine:
         self._played = 0  # seq of the last chunk played to the end
         self._layers: list[list] = []  # [layer, level, target]
         self._duck = 1.0
-        self._held: HeldNote | None = None
-        self._drums = None
+        self._held: Layer | None = None  # the held note: a SynthNote, or a HeldNote sine as fallback
+        self._band = None
         self.devices = (in_info["name"], out_info["name"])
         self.stream = sd.Stream(
             samplerate=STREAM_RATE,
@@ -105,12 +105,15 @@ class AudioEngine:
             for entry in self._layers:
                 entry[2] = 0.0
         self._held = None
+        if self._band is not None:
+            self._band.silence_all()  # so a later start begins from silence, on a fresh bar
 
     def playing_layers(self) -> list[Layer]:
         with self._lock:
             return [layer for layer, _, target in self._layers if target > 0]
 
     def hold_note(self, hz: float | None) -> None:
+        """The sine fallback for a held note (used when the GM SoundFont is not available)."""
         if hz is None:
             if self._held is not None:
                 self.remove_layer(self._held)
@@ -121,28 +124,48 @@ class AudioEngine:
         else:
             self._held.hz = hz
 
-    def drums(self, action: str, params: dict) -> dict:
+    def note(self, action: str, params: dict) -> dict:
+        """A piano note from the GM SoundFont: ``play`` one, ``hold`` one (re-struck until stopped)."""
+        from audio.synth import SynthNote
+
+        try:
+            if action == "play":
+                self.add_layer(SynthNote(params["midi"], seconds=float(params.get("seconds", 0.6))))
+            elif action == "hold":
+                held = self._held
+                if isinstance(held, SynthNote) and held in self.playing_layers():
+                    held.retune(params["midi"])
+                else:
+                    self.hold_note(None)
+                    self._held = SynthNote(params["midi"], repeat=float(params.get("repeat", 1.6)))
+                    self.add_layer(self._held)
+            else:
+                return {"error": f"unknown note action {action!r}"}
+        except Exception as exc:  # noqa: BLE001 - the tool falls back to a plain tone
+            return {"error": str(exc)}
+        return {"ok": True, "holding": self._held is not None and self._held in self.playing_layers()}
+
+    def band(self, action: str, params: dict) -> dict:
+        """Drums, chords and bass on one clock (see audio/band.py); attached while any track plays."""
+        from audio.band import Band
         from audio.drums import DrumMachine
 
-        if self._drums is None:
-            self._drums = DrumMachine(soundfont=Path(params.get("soundfont") or DrumMachine.soundfont_default()))
-        machine = self._drums
-        playing = machine in self.playing_layers()
+        if self._band is None:
+            self._band = Band(Path(params.get("soundfont") or DrumMachine.soundfont_default()))
+        band = self._band
         try:
-            if action == "stop":
-                self.remove_layer(machine)
-                playing = False
-            else:
-                machine.load()
-                machine.request(params, playing)
-                if not playing:
-                    machine.apply_pending_now()  # no bar to wait for
-                    if action == "start":
-                        self.add_layer(machine)
-                        playing = True
+            state = band.request(action, params)
         except Exception as exc:  # noqa: BLE001 - reported to the tool, which tells the model
-            return {"error": str(exc), **machine.state(playing)}
-        return machine.state(playing)
+            return {"error": str(exc), **band.state()}
+        if band.active and band not in self.playing_layers():
+            self.add_layer(band)
+        elif not band.active and band in self.playing_layers():
+            self.remove_layer(band)
+        return state
+
+    def drums(self, action: str, params: dict) -> dict:
+        """The drum tool's requests, routed to the band's drum track."""
+        return self.band({"start": "drums_start", "set": "drums_set", "stop": "drums_stop"}[action], params)
 
     def status(self) -> dict:
         with self._lock:
@@ -152,8 +175,8 @@ class AudioEngine:
             "played": played,
             "queue_empty": queue_empty,
             "layers": len(self.playing_layers()),
-            "holding": self._held.hz if self._held is not None else None,
-            "drums": self._drums.state(self._drums in self.playing_layers()) if self._drums is not None else None,
+            "holding": getattr(self._held, "hz", getattr(self._held, "midi", None)) if self._held is not None else None,
+            "band": self._band.state() if self._band is not None else None,
         }
 
     def close(self) -> None:
@@ -175,6 +198,8 @@ class AudioEngine:
             layer, level, target = entry
             try:
                 samples = np.asarray(layer.render(n), dtype=np.float32)
+                if getattr(layer, "finished", False):
+                    entry[2] = 0.0  # a one-shot note has died away: let it go
             except Exception:  # noqa: BLE001 - a failing layer is dropped, never the stream
                 samples, entry[2] = np.zeros(n, dtype=np.float32), 0.0
             if samples.ndim == 1:
@@ -272,6 +297,12 @@ def main() -> None:
             elif kind == "drums":
                 request_id, action, params = rest
                 send(("reply", request_id, engine.drums(action, params)))
+            elif kind == "band":
+                request_id, action, params = rest
+                send(("reply", request_id, engine.band(action, params)))
+            elif kind == "note":
+                request_id, action, params = rest
+                send(("reply", request_id, engine.note(action, params)))
             elif kind == "close":
                 break
     finally:

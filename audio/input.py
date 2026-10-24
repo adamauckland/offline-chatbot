@@ -204,6 +204,7 @@ class AudioIO:
         self._layers = 0
         self._holding: float | None = None
         self._drums: dict | None = None
+        self._band: dict | None = None
         self._replies: dict[int, dict] = {}
         self._request = 0
         self._closed = False
@@ -238,7 +239,8 @@ class AudioIO:
                     self._queue_empty = info["queue_empty"]
                     self._layers = info["layers"]
                     self._holding = info["holding"]
-                    self._drums = info["drums"]
+                    self._band = info.get("band")
+                    self._drums = self._band["drums"] if self._band else None
                     listeners = list(self._listeners)
                     self._changed.notify_all()
                 if frame is not None:
@@ -334,11 +336,35 @@ class AudioIO:
         with self._lock:
             return self._holding
 
+    def note(self, action: str, **params) -> dict:
+        """Play ("play") or hold ("hold") a piano note from the GM SoundFont; ``error`` if it cannot."""
+        state = self._call("note", action, params)
+        with self._lock:
+            if "error" not in state and action == "hold":
+                self._holding = params.get("midi")
+                self._layers = max(self._layers, 1)
+        return state
+
+    def band(self, action: str, **params) -> dict:
+        """The band (drums, piano chords, bass): start, set, stop, mute, unmute, solo, tempo; see audio/band.py."""
+        state = self._call("band", action, params)
+        with self._lock:
+            self._band = state
+            if "error" not in state and state.get("playing"):
+                self._layers = max(self._layers, 1)
+        return state
+
+    @property
+    def band_state(self) -> dict | None:
+        with self._lock:
+            return self._band
+
     def drums(self, action: str, **params) -> dict:
         """Start, change or stop the drum loop; returns the engine's state (``error`` if it refused)."""
         state = self._call("drums", action, params)
         with self._lock:
-            self._drums = state
+            self._band = state
+            self._drums = state.get("drums", state)
             if "error" not in state:
                 self._layers = max(self._layers, 1) if state.get("playing") else self._layers
         return state
@@ -370,6 +396,7 @@ CUES: dict[str, list[tuple[float, float]]] = {
     "wake": [(660.0, 0.08), (990.0, 0.14)],  # rising pair: the wake word was heard
     "parse": [(1320.0, 0.05), (0.0, 0.04), (1320.0, 0.05)],  # quick double tick: transcribing
     "think": [(990.0, 0.07), (770.0, 0.07), (550.0, 0.14)],  # falling trio: handed to the model
+    "huh": [(660.0, 0.12), (0.0, 0.04), (440.0, 0.22)],  # two falling notes: did not understand
 }
 
 

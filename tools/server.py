@@ -1,11 +1,4 @@
 #!/usr/bin/env python3
-"""Example local API the chatbot can call. Run with:  uv run -m tools.server
-
-Replace these endpoints with whatever actually does the work in your setup
-(a smart-home bridge, a database, a shell script...). The chatbot only needs
-each endpoint to accept JSON or query parameters and return JSON.
-"""
-
 import os
 import threading
 from datetime import datetime
@@ -15,12 +8,12 @@ from pydantic import BaseModel
 
 app = FastAPI(title="chatbot tools")
 
-# In-memory state standing in for real devices.
 LIGHTS: dict[str, bool] = {"living room": False, "kitchen": False, "bedroom": False}
+EXIT_DELAY_SECONDS = 0.3
 
 
 class LightsRequest(BaseModel):
-    state: str  # "on" or "off"
+    state: str
     room: str = "living room"
 
 
@@ -28,12 +21,16 @@ class LightsRequest(BaseModel):
 def set_lights(req: LightsRequest) -> dict:
     room = req.room.lower().strip()
     rooms = list(LIGHTS) if room == "all" else [room]
+
     if any(r not in LIGHTS for r in rooms):
         return {"ok": False, "error": f"unknown room '{room}'", "rooms": list(LIGHTS) + ["all"]}
+
     on = req.state.lower() == "on"
+
     for r in rooms:
         LIGHTS[r] = on
         print(f"[tools_server] lights in {r} -> {'on' if on else 'off'}")
+
     return {"ok": True, "rooms": rooms, "state": "on" if on else "off"}
 
 
@@ -45,17 +42,20 @@ def get_lights() -> dict:
 @app.get("/time")
 def get_time() -> dict:
     now = datetime.now()
+
     return {"time": now.strftime("%H:%M"), "date": now.strftime("%A %d %B %Y")}
 
 
 @app.post("/shutdown")
 def shutdown() -> dict:
-    """Stop this server (the chatbot's "exit" tool calls it). Replies first, then exits."""
     print("[tools_server] shutdown requested", flush=True)
-    # Hard exit after the reply has gone out: uvicorn's graceful shutdown can
-    # wait on idle keep-alive connections, and this server holds no state worth saving.
-    threading.Timer(0.3, lambda: os._exit(0)).start()
+    exit_after_reply_is_sent()
+
     return {"ok": True, "stopping": True}
+
+
+def exit_after_reply_is_sent() -> None:
+    threading.Timer(EXIT_DELAY_SECONDS, lambda: os._exit(0)).start()
 
 
 if __name__ == "__main__":

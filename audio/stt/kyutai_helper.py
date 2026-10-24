@@ -1,19 +1,3 @@
-"""Kyutai STT as a helper process for audio/stt/kyutai.py. Runs in its own environment with moshi-mlx.
-
-Started by kyutai.py as ``uv run --no-project --with moshi-mlx python kyutai_helper.py``,
-because moshi-mlx pins dependencies this project cannot share. Speaks the pipe
-protocol in helper.py: a one-byte command, a four-byte little-endian length and
-that many bytes of 16-bit mono PCM at 16 kHz. ``T`` transcribes a whole
-utterance; ``S``, ``F`` and ``E`` start an utterance, feed it a frame and end
-it, so the model works while the user is still talking and the text is ready
-about half a second after they stop. Replies are one JSON line each for ``T``
-and ``E``.
-
-Based on moshi_mlx.run_inference. The model listens at 24 kHz in 80 ms steps;
-the configured audio delay plus a second of silence is appended at the end so
-the last words come out.
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -29,9 +13,15 @@ import sentencepiece
 from huggingface_hub import hf_hub_download
 from moshi_mlx import models, utils
 
+DEFAULT_REPO = "kyutai/stt-1b-en_fr-mlx"
 MODEL_RATE = 24000
-STEP = 1920  # samples per model step at 24 kHz (80 ms)
+STEP_MS = 80
+STEP = MODEL_RATE * STEP_MS // 1000
 IN_RATE = 16000
+MAX_UTTERANCE_SECONDS = 60
+SILENCE_AFTER_SECONDS = 1.0
+SILENT_TEXT_TOKENS = (0, 3)
+HEADER_BYTES = 5
 
 
 def emit(obj: dict) -> None:
@@ -41,12 +31,58 @@ def emit(obj: dict) -> None:
 
 def read_exactly(n: int) -> bytes | None:
     data = b""
+
     while len(data) < n:
         chunk = sys.stdin.buffer.read(n - len(data))
+
         if not chunk:
             return None
+
         data += chunk
+
     return data
+
+
+def load_language_model(repo: str, config: dict, lm_config) -> models.Lm:
+    weights = hf_hub_download(repo, config.get("moshi_name", "model.safetensors"))
+    model = models.Lm(lm_config)
+    model.set_dtype(mx.bfloat16)
+    quantize_to_match(model, weights)
+    model.load_weights(weights, strict=True)
+
+    return model
+
+
+def quantize_to_match(model: models.Lm, weights: str) -> None:
+    if weights.endswith(".q4.safetensors"):
+        nn.quantize(model, bits=4, group_size=32)
+    elif weights.endswith(".q8.safetensors"):
+        nn.quantize(model, bits=8, group_size=64)
+
+
+def load_audio_tokenizer(repo: str, config: dict, lm_config) -> rustymimi.Tokenizer:
+    mimi = hf_hub_download(repo, config["mimi_name"])
+    codebooks = max(lm_config.generated_codebooks, lm_config.other_codebooks)
+
+    return rustymimi.Tokenizer(mimi, num_codebooks=codebooks)
+
+
+def condition_tensor(model: models.Lm):
+    if model.condition_provider is None:
+        return None
+
+    return model.condition_provider.condition_tensor("description", "very_good")
+
+
+def resample_to_model_rate(pcm16: np.ndarray) -> np.ndarray:
+    n_out = int(len(pcm16) * MODEL_RATE / IN_RATE)
+    positions = np.arange(n_out) * IN_RATE / MODEL_RATE
+
+    return np.interp(positions, np.arange(len(pcm16)), pcm16).astype(np.float32)
+
+
+def silence(seconds: float, rate: int) -> np.ndarray:
+    return np.zeros(int(seconds * rate), dtype=np.float32)
 
 
 class Engine:
@@ -55,101 +91,113 @@ class Engine:
         stt = config.get("stt_config") or {}
         self.delay = float(stt.get("audio_delay_seconds", 0.0))
         self.prefix = float(stt.get("audio_silence_prefix_seconds", 0.0))
-        mimi = hf_hub_download(repo, config["mimi_name"])
-        weights = hf_hub_download(repo, config.get("moshi_name", "model.safetensors"))
-        tokenizer = hf_hub_download(repo, config["tokenizer_name"])
         self.lm_config = models.LmConfig.from_config_dict(config)
-        self.model = models.Lm(self.lm_config)
-        self.model.set_dtype(mx.bfloat16)
-        if weights.endswith(".q4.safetensors"):
-            nn.quantize(self.model, bits=4, group_size=32)
-        elif weights.endswith(".q8.safetensors"):
-            nn.quantize(self.model, bits=8, group_size=64)
-        self.model.load_weights(weights, strict=True)
-        self.text_tokenizer = sentencepiece.SentencePieceProcessor(tokenizer)
         self.other_codebooks = self.lm_config.other_codebooks
-        codebooks = max(self.lm_config.generated_codebooks, self.other_codebooks)
-        self.audio_tokenizer = rustymimi.Tokenizer(mimi, num_codebooks=codebooks)
-        self.ct = None
-        if self.model.condition_provider is not None:
-            self.ct = self.model.condition_provider.condition_tensor("description", "very_good")
-        self.model.warmup(self.ct)
+        self.model = load_language_model(repo, config, self.lm_config)
+        self.text_tokenizer = sentencepiece.SentencePieceProcessor(hf_hub_download(repo, config["tokenizer_name"]))
+        self.audio_tokenizer = load_audio_tokenizer(repo, config, self.lm_config)
+        self.ct = condition_tensor(self.model)
         self.gen = None
-        self.pending = np.zeros(0, dtype=np.float32)  # 24 kHz samples not yet a whole step
+        self.pending = silence(0, MODEL_RATE)
         self.text: list[str] = []
 
-    # -- one utterance -----------------------------------------------------------
+        self.model.warmup(self.ct)
+
     def start(self) -> None:
         mx.random.seed(299792458)
         self.audio_tokenizer.reset()
         self.gen = models.LmGen(
             model=self.model,
-            max_steps=int(60 * MODEL_RATE / STEP),  # up to a minute of speech
+            max_steps=int(MAX_UTTERANCE_SECONDS * MODEL_RATE / STEP),
             text_sampler=utils.Sampler(top_k=25, temp=0.0),
             audio_sampler=utils.Sampler(top_k=250, temp=0.0),
             cfg_coef=1.0,
             check=False,
         )
-        self.pending = np.zeros(int(self.prefix * MODEL_RATE), dtype=np.float32)
+        self.pending = silence(self.prefix, MODEL_RATE)
         self.text = []
 
     def feed(self, pcm16: np.ndarray) -> None:
-        # 16 kHz -> 24 kHz by linear interpolation: ample for speech recognition.
-        n_out = int(len(pcm16) * MODEL_RATE / IN_RATE)
-        resampled = np.interp(np.arange(n_out) * IN_RATE / MODEL_RATE, np.arange(len(pcm16)), pcm16)
-        self.pending = np.concatenate([self.pending, resampled.astype(np.float32)])
+        self.pending = np.concatenate([self.pending, resample_to_model_rate(pcm16)])
+
         while len(self.pending) >= STEP:
             self._step(self.pending[:STEP])
             self.pending = self.pending[STEP:]
 
     def end(self) -> str:
-        self.feed(np.zeros(int((self.delay + 1.0) * IN_RATE), dtype=np.float32))
+        self.feed(silence(self.delay + SILENCE_AFTER_SECONDS, IN_RATE))
         text = "".join(self.text).replace("▁", " ").strip()
         self.gen = None
+
         return text
 
     def _step(self, samples: np.ndarray) -> None:
         tokens = self.audio_tokenizer.encode_step(samples[None, None, :])
         tokens = mx.array(tokens).transpose(0, 2, 1)[:, :, : self.other_codebooks]
         token = self.gen.step(tokens[0], self.ct)[0].item()
-        if token not in (0, 3):
+
+        if token not in SILENT_TEXT_TOKENS:
             self.text.append(self.text_tokenizer.id_to_piece(token))
+
+
+def read_message() -> tuple[bytes, np.ndarray] | None:
+    header = read_exactly(HEADER_BYTES)
+
+    if header is None:
+        return None
+
+    command, length = header[:1], struct.unpack("<I", header[1:])[0]
+    payload = read_exactly(length) if length else b""
+
+    if payload is None:
+        return None
+
+    return command, np.frombuffer(payload, dtype="<i2").astype(np.float32) / 32767
+
+
+def handle(engine: Engine, command: bytes, pcm: np.ndarray) -> None:
+    if command == b"T":
+        engine.start()
+        engine.feed(pcm)
+        emit({"text": engine.end()})
+    elif command == b"S":
+        engine.start()
+    elif command == b"F":
+        engine.feed(pcm)
+    elif command == b"E":
+        emit({"text": engine.end()})
+    else:
+        emit({"error": f"unknown command {command!r}"})
+
+
+def serve(engine: Engine) -> None:
+    while True:
+        message = read_message()
+
+        if message is None:
+            return
+
+        command, pcm = message
+
+        try:
+            handle(engine, command, pcm)
+        except Exception as exc:
+            emit({"error": str(exc)})
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--hf-repo", default="kyutai/stt-1b-en_fr-mlx")
+    parser.add_argument("--hf-repo", default=DEFAULT_REPO)
     args = parser.parse_args()
+
     try:
         engine = Engine(args.hf_repo)
-    except Exception as exc:  # noqa: BLE001 - report it to the parent, then exit
+    except Exception as exc:
         emit({"error": f"could not load {args.hf_repo}: {exc}"})
         return
+
     emit({"ready": True})
-    while True:
-        header = read_exactly(5)
-        if header is None:
-            return
-        command, length = header[:1], struct.unpack("<I", header[1:])[0]
-        payload = read_exactly(length) if length else b""
-        if payload is None:
-            return
-        pcm = np.frombuffer(payload, dtype="<i2").astype(np.float32) / 32767
-        try:
-            if command == b"T":
-                engine.start()
-                engine.feed(pcm)
-                emit({"text": engine.end()})
-            elif command == b"S":
-                engine.start()
-            elif command == b"F":
-                engine.feed(pcm)
-            elif command == b"E":
-                emit({"text": engine.end()})
-            else:
-                emit({"error": f"unknown command {command!r}"})
-        except Exception as exc:  # noqa: BLE001
-            emit({"error": str(exc)})
+    serve(engine)
 
 
 if __name__ == "__main__":

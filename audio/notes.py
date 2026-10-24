@@ -2,8 +2,9 @@
 
 A note is named the usual way, a letter A to G, an optional sharp (``#``) or
 flat (``b``), and an octave (``C4`` is middle C, ``A4`` is 440 Hz); the octave
-defaults to 4 so "A" or "F#" work too. The sound is the same Hann-shaped sine
-as the chatbot's cues, so it does not click.
+defaults to 4 so "A" or "F#" work too. The notes are played on the piano of a
+General MIDI SoundFont (see ``audio/synth.py``), falling back to a plain sine
+tone when that cannot be loaded.
 """
 
 from __future__ import annotations
@@ -39,24 +40,43 @@ def note_frequency(name: str) -> float:
     return 440.0 * 2 ** ((midi - 69) / 12)
 
 
+def note_midi(frequency: float) -> int:
+    """The MIDI key nearest ``frequency``."""
+    import math
+
+    return int(round(69 + 12 * math.log2(frequency / 440.0)))
+
+
 def play_note(audio: AudioIO, note: str = "A4", seconds: float | str = DEFAULT_SECONDS) -> dict:
-    """Play ``note`` for ``seconds``; returns what was played for the model."""
+    """Play ``note`` for ``seconds`` on the piano (a plain tone if the SoundFont is not available)."""
     try:
         frequency = note_frequency(str(note))
         length = max(0.05, min(MAX_SECONDS, float(seconds)))
     except (TypeError, ValueError) as exc:
         return {"ok": False, "error": str(exc)}
-    audio.play(tone(frequency, length, volume=VOLUME))
-    return {"ok": True, "note": str(note).strip(), "frequency_hz": round(frequency, 2), "seconds": length}
+    state = audio.note("play", midi=note_midi(frequency), seconds=length) if hasattr(audio, "note") else {"error": "-"}
+    instrument = "piano"
+    if "error" in state:
+        audio.play(tone(frequency, length, volume=VOLUME))
+        instrument = "tone"
+    return {
+        "ok": True,
+        "note": str(note).strip(),
+        "frequency_hz": round(frequency, 2),
+        "seconds": length,
+        "instrument": instrument,
+    }
 
 
 def keep_playing_note(audio: AudioIO, note: str = "A4") -> dict:
-    """Hold ``note`` until the user says stop (or ``stop_note`` is called); a new note replaces it."""
+    """Hold ``note`` on the piano, struck again every so often, until the user says stop."""
     try:
         frequency = note_frequency(str(note))
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
-    audio.hold_note(frequency)
+    state = audio.note("hold", midi=note_midi(frequency)) if hasattr(audio, "note") else {"error": "-"}
+    if "error" in state:
+        audio.hold_note(frequency)
     return {
         "ok": True,
         "note": str(note).strip(),

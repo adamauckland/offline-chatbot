@@ -193,14 +193,19 @@ def play_drums(audio: AudioIO, pattern=DEFAULT_PATTERN, bpm=None, kit=None) -> d
     state = audio.drums("start", soundfont=DrumMachine.soundfont_default(), pattern=pattern, bpm=bpm, kit=kit)
     if "error" in state:
         return {"ok": False, "error": state["error"]}
-    return {"ok": True, **state}
+    return {"ok": True, **state.get("drums", state)}
 
 
 def set_tempo(audio: AudioIO, bpm) -> dict:
     state = audio.drums("set", soundfont=DrumMachine.soundfont_default(), bpm=bpm)
     if "error" in state:
         return {"ok": False, "error": state["error"]}
-    return {"ok": True, **state}
+    drums = state.get("drums", state)
+    return {
+        "ok": True,
+        "bpm": state.get("bpm", drums.get("bpm")),
+        "playing": state.get("playing", drums.get("playing")),
+    }
 
 
 def drum_tools(audio: AudioIO) -> list[Tool]:
